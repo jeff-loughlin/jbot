@@ -1,3 +1,5 @@
+#define PI 3.14159265
+
 #include <time.h>
 #include <sys/time.h>
 #include <string.h>
@@ -8,10 +10,9 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <ctype.h>
-#include "PID_v1.h"
-#include "kalman.h"
+#include "pid.h"
+#include "filter.h"
 #include <pthread.h>
-#include "include.h"
 #include "geocoords.h"
 
 //#define _POSIX_SOURCE 1 /* POSIX compliant source */
@@ -89,15 +90,15 @@ public:
 };
 
 
-// Kalman filters for smoothing magnetometerm, accelerometer, and calculated heading data
-Kalman headingFilter(0.125, 4, 1, 0);
-Kalman xFilter(0.125, 4, 1, 0);
-Kalman yFilter(0.125, 4, 1, 0);
-Kalman zFilter(0.125, 4, 1, 0);
+// Filters for smoothing magnetometerm, accelerometer, and calculated heading data
+Filter headingFilter(0.125, 4, 1, 0);
+Filter xFilter(0.125, 4, 1, 0);
+Filter yFilter(0.125, 4, 1, 0);
+Filter zFilter(0.125, 4, 1, 0);
 
-Kalman xAccFilter(0.125, 4, 1, 0);
-Kalman yAccFilter(0.125, 4, 1, 0);
-Kalman zAccFilter(0.125, 4, 1, 0);
+Filter xAccFilter(0.125, 4, 1, 0);
+Filter yAccFilter(0.125, 4, 1, 0);
+Filter zAccFilter(0.125, 4, 1, 0);
 
 
 
@@ -295,487 +296,11 @@ void ProcessSerialMsg(const char *msg)
 
 
 
-// extract the NED angles in degrees from the NED rotation matrix (used by getHeadingNew() - remove this if we decide not
-// to use that function
-void GetAnglesDegFromRotationMatrix(float R[3][3], float *pfPhiDeg, float *pfTheDeg, float *pfPsiDeg, float *pfRhoDeg)
-{
-    // calculate the pitch angle -90.0 <= Theta <= 90.0 deg
-    if (R[0][2] >= 1.0F)
-        *pfTheDeg = -90.0F;
-    else if (R[0][2] <= -1.0F)
-        *pfTheDeg = 90.0F;
-    else
-        *pfTheDeg = (float) asin(-R[0][2]) * RADTODEG;
-
-    // calculate the roll angle range -180.0 <= Phi < 180.0 deg
-    *pfPhiDeg = (float)atan2(R[1][2], R[2][2]) * RADTODEG;
-
-    // map +180 roll onto the functionally equivalent -180 deg roll
-    if (*pfPhiDeg == 180.0F)
-        *pfPhiDeg = -180.0F;
-
-    // calculate the yaw and compass angle 0.0 <= Psi < 360.0 deg
-    *pfPsiDeg = (float)atan2(R[0][1], R[0][0]) * RADTODEG;
-    if (*pfPsiDeg < 0.0F)
-        *pfPsiDeg += 360.0F;
-
-    // check for rounding errors mapping small negative angle to 360 deg
-    if (*pfPsiDeg >= 360.0F)
-        *pfPsiDeg = 0.0F;
-
-    // for NED, the compass heading Rho equals the yaw angle Psi
-    *pfRhoDeg = *pfPsiDeg;
-    return;
-}
-
-
-// Used by getHeadingNew() - remove this if we decide not to use that function
-float PerformSensorFusion(float cx, float cy, float cz, float nx, float ny, float nz, float *theta, float *phi, float *psi, float *rho)
-{
-    float matrix [3][3];
-
-    // place the un-normalized gravity and geomagnetic vectors into the rotation matrix z and x axes
-    matrix[0][2] = nx;
-    matrix[1][2] = ny;
-    matrix[2][2] = nz;
-    matrix[0][0] = cx;
-    matrix[1][0] = cy;
-    matrix[2][0] = cz;
-
-    // set y vector to vector product of z and x and g vectors
-    matrix[0][1] = matrix[1][2] * matrix[2][0] - matrix[2][2] * matrix[1][0];
-    matrix[1][1] = matrix[2][2] * matrix[0][0] - matrix[0][2] * matrix[2][0];
-    matrix[2][1] = matrix[0][2] * matrix[1][0] - matrix[1][2] * matrix[0][0];
-
-    // set x vector to vector product of y and z and g vectos
-    matrix[0][0] = matrix[1][1] * matrix[2][2] - matrix[2][1] * matrix[1][2];
-    matrix[1][0] = matrix[2][1] * matrix[0][2] - matrix[0][1] * matrix[2][2];
-    matrix[2][0] = matrix[0][1] * matrix[1][2] - matrix[1][1] * matrix[0][2];
-
-    // calculate the vector moduli
-//    float fmodB;
-    float fmodG, fmodx, fmody;
-//    float fsinDelta;
-
-    fmodG =  (float) sqrt(nx * nx + ny * ny + nz * nz);
-//    fmodB =  (float) sqrt(cx * cx + cy * cy + cz * cz);
-    fmodx = (float) sqrt(matrix[0][0] * matrix[0][0] + matrix[1][0] * matrix[1][0] + matrix[2][0] * matrix[2][0]);
-    fmody = (float) sqrt(matrix[0][1] * matrix[0][1] + matrix[1][1] * matrix[1][1] + matrix[2][1] * matrix[2][1]);
-
-    // normalize the rotation matrix
-    if (!((fmodx == 0.0F) || (fmody == 0.0F) || (fmodG == 0.0F)))
-    {
-        // normalize x axis
-        matrix[0][0] /= fmodx;
-        matrix[1][0] /= fmodx;
-        matrix[2][0] /= fmodx;
-
-        // normalize y axis
-        matrix[0][1] /= fmody;
-        matrix[1][1] /= fmody;
-        matrix[2][1] /= fmody;
-
-        // normalize z axis
-        matrix[0][2] /= fmodG;
-        matrix[1][2] /= fmodG;
-        matrix[2][2] /= fmodG;
-
-        // estimate the declination angle Delta (90 minus angle between the vectors)
-//        fsinDelta = (nx * cx + ny * cy + nz * cz) / fmodG / fmodB;
-
-//        pthisSV6DOF->fDelta6DOFn = (float) asin(fsinDelta) * RADTODEG;
-    }
-    else
-    {
-        // no solution is possible so set rotation to identity matrix and delta to 0 degrees
-//        fmatrixAeqI(matrix, 3);
-//        pthisSV6DOF->fDelta6DOFn = 0.0F;
-        // Can't calculate.  Just return the current heading instead of garbage.  We'll get it right next time.
-        return heading;
-    }
-
-    // extract the roll, pitch and yaw angles from the rotation matrix
-//    float phi, theta, psi, rho;  // phi = roll angle, theta = pitch angle, psi = yaw angle, rho = compass heading
-    GetAnglesDegFromRotationMatrix(matrix, phi, theta, psi, rho);
-
-    // get the instantaneous orientation quaternion
-//    fQuaternionFromRotationMatrix(matrix, &(pthisSV6DOF->fq6DOFn));
-
-    float compassHeading =  (float)atan2(matrix[0][1], matrix[0][0]) * (180 / PI);
-    if (compassHeading < 0.0F)
-        compassHeading += 360.0F;
-
-    return compassHeading;
-}
-
-
-
-void fSixDOFSensorDrivers(struct AccelSensor *thisAccel, struct MagSensor *thisMag)
-{
-    thisMag->iBpx = magX;
-    thisMag->iBpy = magY;
-    thisMag->iBpz = magZ;
-
-    thisMag->fBpx = magX / FCOUNTSPERUT;
-    thisMag->fBpy = magY / FCOUNTSPERUT;
-    thisMag->fBpz = magZ / FCOUNTSPERUT;
-
-
-    thisAccel->iGpx = accelX;
-    thisAccel->iGpy = accelY;
-    thisAccel->iGpz = accelZ;
-
-    thisAccel->fGpx = accelX / FCOUNTSPERG;
-    thisAccel->fGpy = accelY / FCOUNTSPERG;
-    thisAccel->fGpz = accelZ / FCOUNTSPERG;
-}
-
-
-
-int loopcounter = 0;
-struct SV6DOF thisSV6DOF;                   // 6DOF state vector
-struct MagCalibration thisMagCal;           // hard and soft iron magnetic calibration
-struct MagneticBuffer thisMagneticBuffer;   // magnetometer measurement buffer
-
-// low pass filter parameters
-float fb0, fa1, fa2;
-
-int iSolutionSize = 7;
-
-// general purpose arrays
-float xftmpA10x10[10][10], *ftmpA10x10[10];             // scratch 10x10 matrix 
-float xftmpB10x10[10][10], *ftmpB10x10[10];             // scratch 10x10 matrix 
-float xftmpA10x1[10][1], *ftmpA10x1[10];                // scratch 10x1 matrix
-float xftmpA7x7[7][7], *ftmpA7x7[7];                    // scratch 7x7 matrix
-float xftmpB7x7[7][7], *ftmpB7x7[7];                    // scratch 7x7 matrix 
-float xftmpA7x1[7][1], *ftmpA7x1[7];                    // scratch 7x1 matrix 
-float xftmpA4x4[4][4], *ftmpA4x4[4];                    // scratch 4x4 matrix
-float xftmpB4x4[4][4], *ftmpB4x4[4];                    // scratch 4x4 matrix 
-float xftmpA3x3[3][3], *ftmpA3x3[3];                    // scratch 3x3 matrix 
-float xftmpA4x1[4][1], *ftmpA4x1[4];                    // scratch 4x1 matrix 
-float xftmpB4x1[4][1], *ftmpB4x1[4];                    // scratch 4x1 matrix 
-float xftmpA3x1[3][1], *ftmpA3x1[3];                    // scratch 3x1 vector 
-
-
-float getHeadingNewNew()
-{
-    struct AccelSensor thisAccel;
-    struct MagSensor thisMag;
-    fSixDOFSensorDrivers(&thisAccel, &thisMag);
-
-    // update the magnetometer measurement buffer integer magnetometer data
-    fUpdateMagnetometerBuffer(&thisMagneticBuffer, &thisMag, &thisAccel, loopcounter);
-
-    // remove hard and soft iron terms from Bp (uT) to get calibrated data Bc (uT)
-    fInvertMagCal(&thisMag, &thisMagCal);
-
-    // pass the accel and calibrated mag data to the eCompass
-    feCompassDirectNED(&thisSV6DOF, &thisMag, &thisAccel);
-
-    // low pass filter the orientation matrix and get low pass quaternion and Euler angles
-    int iCoordSystem = 0;
-    fLPFOrientationMatrix(&thisSV6DOF, iCoordSystem, loopcounter, fb0, fa1, fa2);
-
-    // shuffle the rotation matrix low pass filter delay lines
-    for (int i = 0; i < 3; i++)
-        for (int j = 0; j < 3; j++)
-        {
-            thisSV6DOF.fLPR6DOFnm2[i][j] = thisSV6DOF.fLPR6DOFnm1[i][j];
-            thisSV6DOF.fLPR6DOFnm1[i][j] = thisSV6DOF.fLPR6DOFn[i][j];
-            thisSV6DOF.fR6DOFnm2[i][j] = thisSV6DOF.fR6DOFnm1[i][j];
-            thisSV6DOF.fR6DOFnm1[i][j] = thisSV6DOF.fR6DOFn[i][j];
-        }
-
-    // update the inclination angle low pass filter delay lines
-    thisSV6DOF.fLPDelta6DOFnm2 = thisSV6DOF.fLPDelta6DOFnm1;
-    thisSV6DOF.fLPDelta6DOFnm1 = thisSV6DOF.fLPDelta6DOFn;
-    thisSV6DOF.fDelta6DOFnm2 = thisSV6DOF.fDelta6DOFnm1;
-    thisSV6DOF.fDelta6DOFnm1 = thisSV6DOF.fDelta6DOFn;
-
-    // the following section of code executes the calibration algorithms
-    // and decides if the new calibration should be accepted. this code
-    // is compute-intensive and is best implemented under an RTOS as a low priority
-    // task which might execute every minute or so. here it is implemented
-    // in a single process which is a simpler way to demonstrate.
-
-    // decision as to whether to calibrate is the logical OR of these conditions
-    // line 1: if we don't yet have a calibration
-    // line 2: if we have limited measurements (MEDEQUATIONS or less) and INITIALCALINTERVAL iterations have passed
-    // line 3: every FINALCALINTERVAL iterations
-    if (thisMagneticBuffer.iMagBufferCount >= MINEQUATIONS)
-    {
-        // calibrate if this will be the first calibration
-        // or initially ever INITIALCALINTERVAL iterations or
-        // ultimately every FINALCALINTERVAL iterations
-        if ((!thisMagCal.iValidMagCal) ||
-            (thisMagCal.iValidMagCal && !(loopcounter % INITIALCALINTERVAL) && (thisMagneticBuffer.iMagBufferCount <= MEDEQUATIONS)) ||
-            (thisMagCal.iValidMagCal && !(loopcounter % FINALCALINTERVAL)))
-        {
-                // 10 point eigenpair calibration
-                if (iSolutionSize == 10)
-                {
-                    printf("\n\nCalling 10 element EIG calibration at iteration %d with %lu in Magnetic Buffer", loopcounter, thisMagneticBuffer.iMagBufferCount);
-                    fUpdateCalibration10EIG(&thisMagCal, &thisMagneticBuffer, ftmpA10x10, ftmpB10x10, ftmpA10x1, ftmpA3x3, ftmpA3x1);
-                }
-                // 7 point eigenpair calibration
-                else if (iSolutionSize == 7)
-                {
-                    printf("\n\nCalling 7 element EIG calibration at iteration %d with %lu in Magnetic Buffer", loopcounter, thisMagneticBuffer.iMagBufferCount);
-                    fUpdateCalibration7EIG(&thisMagCal, &thisMagneticBuffer, ftmpA7x7, ftmpB7x7, ftmpA7x1);
-                }
-                // 4 point INV calibration
-                else
-                {
-//                    printf("\n\nCalling 4 element INV calibration at iteration %d with %d in Magnetic Buffer", loopcounter, thisMagneticBuffer.iMagBufferCount);
-//                    fUpdateCalibration4INV(&thisMagCal, &thisMagneticBuffer, ftmpA4x4, ftmpB4x4,
-//                                             ftmpA4x1, ftmpB4x1, icolind, irowind, ipivot);
-                }
-                // for convenience show the original optimal invW
-//                printf("\n\nFor comparison: Simulation inverse soft iron matrix invW (normalized)");
-//                fmatrixPrintA(thisSimulation.finvW, 0, 2, 0, 2);
-
-                // accept new calibration if:
-                // a) number of measurements is MEDEQUATIONS or less or
-                // b) fit error is reduced and geomagnetic field is in range
-                // (actual range of geomagnetic field strength B on earth varies 22uT to 67uT)
-                if ((thisMagneticBuffer.iMagBufferCount <= MEDEQUATIONS) ||
-                  (  (thisMagCal.ftrFitErrorpc <= thisMagCal.fFitErrorpc) &&
-                    (thisMagCal.ftrB >= MINBFIT) && (thisMagCal.ftrB <= MAXBFIT)) ) // *jdl* added parens around && clause (spaced parens)
-                {
-                    printf("\n\nAccepting new calibration solution");
-                    thisMagCal.fFitErrorpc = thisMagCal.ftrFitErrorpc;
-                    thisMagCal.fB = thisMagCal.ftrB;
-                    thisMagCal.fVx = thisMagCal.ftrVx;
-                    thisMagCal.fVy = thisMagCal.ftrVy;
-                    thisMagCal.fVz = thisMagCal.ftrVz;
-                    fmatrixAeqB(thisMagCal.finvW, thisMagCal.ftrinvW, 3, 3);
-                }
-                else
-                {
-                    printf("\n\nRejecting new calibration solution");
-                }
-
-                // age (increase) the calibration fit to avoid a good calibration preventing future updates
-                // FITERRORAGING is the reciprocal of the time (s) for the fit error to increase by e=2.718
-                // FINALCALINTERVAL * DELTAT is the interval in seconds between each aging update of fFitErrorpc
-                // (1 + FITERRORAGING * FINALCALINTERVAL * DELTAT)^n=e defines n, the number of updates for e fold increase
-                // approx n * FINALCALINTERVAL * DELTAT = 1. / FITERRORAGING
-                // so as required FITERRORAGING is the reciprocal of the time in secs for e fold increase
-                thisMagCal.fFitErrorpc += thisMagCal.fFitErrorpc * FITERRORAGING * (float) FINALCALINTERVAL * DELTAT;
-         } // end of test whether to call calibration functions
-    }
-  else // still too few entries in magnetic buffer for calibration
-      printf("%lu entries in magnetometer buffer is insufficient for calibration\n", thisMagneticBuffer.iMagBufferCount);
-
-    loopcounter++;
-    return thisSV6DOF.fPsi6DOF;
-}
-
 float rollAngle = 0;
 float pitchAngle = 0;
 float yawAngle = 0;
-float CFAngleX1 = 0;
-float CFAngleY1 = 0;
-
-float getHeadingNew()
-{
-//    float fmodB;
-    float fmodG, fmodx, fmody;
-//    float fsinDelta;
-    float matrix[3][3];
-
-    // If we don't have calibration data yet then we have no business being here
-    if (xMax == xMin || yMax == yMin || zMax == zMin)
-        return 0;
-
-
-    // Normalize raw magnetometer data to a unit circle with the calibraton limits
-    float cx = (float)(magX-xMin)/(float)(xMax-xMin) - 0.5;
-    float cy = (float)(magY-yMin)/(float)(yMax-yMin) - 0.5;
-    float cz = (float)(magZ-zMin)/(float)(zMax-zMin) - 0.5;
-
-    // Convert accelerometer data from m/s^2 to G
-    float rx = -(float)accelX;// / 980;  // 9.8
-    float ry = -(float)accelY;// / 980;  // 9.8
-    float rz = -(float)accelZ;// / 980;  // 9.8
-
-/*
-    // Convert gyro data to instantaneous angular measurement
-    float gx = (float)gyroX * 0.00875 * (PI / 180);
-    float gy = (float)gyroY * 0.00875 * (PI / 180);
-    float gz = (float)gyroZ * 0.00875 * (PI / 180);
-*/
-    float accelTheta, accelPhi, accelPsi, accelRho;
-    /*float headingAccel = */PerformSensorFusion(cx, cy, cz, rx, ry, rz, &accelTheta, &accelPhi, &accelPsi, &accelRho);
-//    printf("Tilt-compensated heading: %f\n", headingAccel + (0.20780084 * 180 / PI));
-
-
-
-    // Now we have in headingAccel the heading calculated from the magnetometer, tilt-compensated based on the orientation
-    // reported by the accelerometers.  We'll use this as a long-term indication of heading.  That is, when siting still, this
-    // is what we would consider our heading to be.  Now use the gyros to deal with short-term changes in the orientation.
-    // If we suddenly pitch upwards or roll left or right, the gyros will tell us by how much our orientation changed over
-    // the last 100ms.  Integrate that over time to give us the current heading, offset from the long-term calculation in
-    // headingAccel.  This way, when we're sitting still or moving in a straight line, the gyros will read near zero and
-    // most of the heading calculation comes from the magnetometer (tilt-compensated by the accelerometer).  When we're
-    // turning or bouncing around, the gyros will represent a larger portion of the calculation, and the heading comes
-    // mainly from the integration of gyro readings over time.
-    //
-
-    // Factor in the gyros to smooth out any short-term movements
-    float gx = gyroX * 0.00875;
-    float gy = gyroY * 0.00875;
-//    float gz = gyroZ * 0.00875;
-
-    printf("accelPhi: %f\n", accelPhi);
-    printf("accelTheta: %f\n", accelTheta);
-
-    CFAngleX1 = 0.5 * (CFAngleX1 + (gx * 3.14 / 180) * ((float)gyroDeltaT / 1000.0)) + 0.5 * accelPhi * PI / 180;
-    CFAngleY1 = 0.5 * (CFAngleY1 + (gy * 3.14 / 180) * ((float)gyroDeltaT / 1000.0)) + 0.5 * accelTheta * PI / 180;
-
-
-    // Now use trigonometry to project the magnetic unit circle onto a 2D X-Y plane oriented at the calculated angles.
-    // X and Y will be the point on the unit circle that represents our compass heading.
-    float y = (cz * sin(CFAngleX1)) - (cy * cos(CFAngleX1));
-    float x = (cx * cos(CFAngleY1))
-                     + (cy * sin(CFAngleY1) * sin(CFAngleX1))
-                     + (cz * sin(CFAngleY1) * cos(CFAngleX1));
-
-
-    // Find the compass heading for the calculated x and y
-    float yawAngle = atan2(y, x);
-
-    // Factor in the declination angle for this location  (from http://www.ngdc.noaa.gov/geomag-web/#declination)
-    float declinationAngle = 0.20780084;  // should this be negative?
-    yawAngle += declinationAngle;
-
-    // Convert to degrees
-    yawAngle = yawAngle * 180 / 3.14;
-
-    // Convert to range (0, 360)
-    yawAngle = (yawAngle > 0.0 ? yawAngle : (360.0 + yawAngle));
-
-    return fabs(yawAngle - 360);
-
-
-
-
-
-
-/*
-    float gyroTheta, gyroPhi, gyroPsi, gyroRho;
-    PerformSensorFusion(cx, cy, cz, gx, gy, gz, &gyroTheta, &gyroPhi, &gyroPsi, &gyroRho);
-
-    rollAngle = 0.95 * (rollAngle + gyroPhi * gyroDeltaT / 1000.0F) + (0.05 * accelPhi * PI / 180);
-    pitchAngle = 0.95 * (pitchAngle + gyroTheta * gyroDeltaT / 1000.0F) + (0.05 * accelTheta * PI / 180);
-    yawAngle = 0.95 * (yawAngle + gyroRho * gyroDeltaT / 1000.0F) + (0.05 * accelRho * PI / 180);
-
-    float headingGyro = yawAngle / 2;
-
-    printf("Heading by accel: %f\n", headingAccel);
-    printf("Heading by gyro: %f\n", headingGyro);
-
-    return (int)(headingAccel * 0.05 + headingGyro * 0.95);
-*/
-    // place the un-normalized gravity and geomagnetic vectors into the rotation matrix z and x axes
-    matrix[0][2] = rx;
-    matrix[1][2] = ry;
-    matrix[2][2] = rz;
-    matrix[0][0] = cx;
-    matrix[1][0] = cy;
-    matrix[2][0] = cz;
-
-    // set y vector to vector product of z and x and g vectors
-    matrix[0][1] = matrix[1][2] * matrix[2][0] - matrix[2][2] * matrix[1][0];
-    matrix[1][1] = matrix[2][2] * matrix[0][0] - matrix[0][2] * matrix[2][0];
-    matrix[2][1] = matrix[0][2] * matrix[1][0] - matrix[1][2] * matrix[0][0];
-
-    // set x vector to vector product of y and z and g vectos
-    matrix[0][0] = matrix[1][1] * matrix[2][2] - matrix[2][1] * matrix[1][2];
-    matrix[1][0] = matrix[2][1] * matrix[0][2] - matrix[0][1] * matrix[2][2];
-    matrix[2][0] = matrix[0][1] * matrix[1][2] - matrix[1][1] * matrix[0][2];
-
-    // calculate the vector moduli
-    fmodG =  (float) sqrt(rx * rx + ry * ry + rz * rz);
-//    fmodB =  (float) sqrt(cx * cx + cy * cy + cz * cz);
-    fmodx = (float) sqrt(matrix[0][0] * matrix[0][0] + matrix[1][0] * matrix[1][0] + matrix[2][0] * matrix[2][0]);
-    fmody = (float) sqrt(matrix[0][1] * matrix[0][1] + matrix[1][1] * matrix[1][1] + matrix[2][1] * matrix[2][1]);
-
-    // normalize the rotation matrix
-    if (!((fmodx == 0.0F) || (fmody == 0.0F) || (fmodG == 0.0F)))
-    {
-        // normalize x axis
-        matrix[0][0] /= fmodx;
-        matrix[1][0] /= fmodx;
-        matrix[2][0] /= fmodx;
-
-        // normalize y axis
-        matrix[0][1] /= fmody;
-        matrix[1][1] /= fmody;
-        matrix[2][1] /= fmody;
-
-        // normalize z axis
-        matrix[0][2] /= fmodG;
-        matrix[1][2] /= fmodG;
-        matrix[2][2] /= fmodG;
-
-        // estimate the declination angle Delta (90 minus angle between the vectors)
-//        fsinDelta = (rx * cx + ry * cy + rz * cz) / fmodG / fmodB;
-
-//        pthisSV6DOF->fDelta6DOFn = (float) asin(fsinDelta) * RADTODEG;
-    }
-    else
-    {
-        // no solution is possible so set rotation to identity matrix and delta to 0 degrees
-//        fmatrixAeqI(matrix, 3);
-//        pthisSV6DOF->fDelta6DOFn = 0.0F;
-    }
-
-    // extract the roll, pitch and yaw angles from the rotation matrix
-//    float phi, theta, psi, rho;  // phi = roll angle, theta = pitch angle, psi = yaw angle, rho = compass heading
-//    GetAnglesDegFromRotationMatrix(matrix, &phi, &theta, &psi, &rho);
-
-    // get the instantaneous orientation quaternion
-//    fQuaternionFromRotationMatrix(matrix, &(pthisSV6DOF->fq6DOFn));
-
-    float compassHeading =  (float)atan2(matrix[0][1], matrix[0][0]) * (180 / PI);
-    if (compassHeading < 0.0F)
-        compassHeading += 360.0F;
-
-    return compassHeading;
-
-#ifdef JUNK
-    // Now figure in the gyro rotation
-    float normValues[3];
-
-    // Calculate the angular speed of the sample
-    float omegaMagnitude = (float)sqrt(gyroValues[0] * gyroValues[0] +
-                                         gyroValues[1] * gyroValues[1] +
-                                         gyroValues[2] * gyroValues[2]);
-
-    // Normalize the rotation vector if it's big enough to get the axis
-    if(omegaMagnitude > EPSILON)
-    {
-        normValues[0] = gyroValues[0] / omegaMagnitude;
-        normValues[1] = gyroValues[1] / omegaMagnitude;
-        normValues[2] = gyroValues[2] / omegaMagnitude;
-    }
-
-    // Integrate around this axis with the angular speed by the timestep
-    // in order to get a delta rotation from this sample over the timestep
-    // We will convert this axis-angle representation of the delta rotation
-    // into a quaternion before turning it into the rotation matrix.
-    float dT = (float)gyroDeltaTime / 1000.0;
-    float thetaOverTwo = omegaMagnitude * dT;
-    float sinThetaOverTwo = sin(thetaOverTwo);
-    float cosThetaOverTwo = cos(thetaOverTwo);
-    deltaRotationVector[0] = sinThetaOverTwo * normValues[0];
-    deltaRotationVector[1] = sinThetaOverTwo * normValues[1];
-    deltaRotationVector[2] = sinThetaOverTwo * normValues[2];
-    deltaRotationVector[3] = cosThetaOverTwo;
-    return (int)rho;
-#endif
-}
+//float CFAngleX1 = 0;
+//float CFAngleY1 = 0;
 
 
 
@@ -999,35 +524,8 @@ void SteerToHeading(ControlMode *steerToHeadingControl)
     zAccFilter.update(accelZ);
     accelZ = zAccFilter.GetValue();
 
-    // Collect timing data for each of the 3 heading calculation methods.  Ultimately we'll choose one of these and timing
-    // may or may not be a consideration
-    unsigned long startTime[3], endTime[3];
-    startTime[0] = millis();
-    float complexHeading = getHeadingNewNew();
-    endTime[0] = millis();
-//    startTime[1] = millis();
-//    float simpleHeading = getHeadingNew();
-//    endTime[1] = millis();
-    startTime[2] = millis();
-    float reallySimpleHeading = getHeading();
-    endTime[2] = millis();
-    printf("Heading (complex method - %lums): %f (%scalibrated)\n", endTime[0] - startTime[0], complexHeading, thisMagCal.iValidMagCal ? "" : "not ");
-//    printf("Heading (matrix + gyro - %lums):  %f (default calibration)\n", endTime[1] - startTime[1], simpleHeading);
-    printf("Heading (simple - %lums):         %f (default calibration)\n", endTime[2] - startTime[2], reallySimpleHeading);
-
-    if (thisMagCal.iValidMagCal)
-    {
-        printf("Using complex heading\n");
-        heading = complexHeading;
-    }
-    else
-    {
-//        printf("Using matrix + gyro heading\n");
-//        heading = simpleHeading;
-        printf("Using simple heading\n");
-        heading = reallySimpleHeading;
-    }
-
+    float heading = getHeading();
+    printf("Heading:         %f (default calibration)\n", heading);
 
     float filteredHeading = heading;
 
@@ -1352,76 +850,6 @@ static void *ReadSerialThread(void *)
 }
 
 
-// Initialize various arrays and values used by the matrix math routines for heading calculations.
-void InitMagCalibrationData()
-{
-    // initialize the pointers to arrays as workaround to C function limitations with variable size arrays
-    // keep in main since C functions require compile-time knowledge of the number of matrix rows
-    // 3 row arrays
-    for (int i = 0; i < 3; i++)
-    {
-        thisMagCal.finvW[i] = thisMagCal.xfinvW[i];
-        thisMagCal.ftrinvW[i] = thisMagCal.xftrinvW[i];
-        thisMagCal.fA[i] = thisMagCal.xfA[i];
-        thisMagCal.finvA[i] = thisMagCal.xinvA[i];
-        thisSV6DOF.fR6DOFn[i] = thisSV6DOF.xfR6DOFn[i];
-        thisSV6DOF.fR6DOFnm1[i] = thisSV6DOF.xfR6DOFnm1[i];
-        thisSV6DOF.fR6DOFnm2[i] = thisSV6DOF.xfR6DOFnm2[i];
-        thisSV6DOF.fLPR6DOFn[i] = thisSV6DOF.xfLPR6DOFn[i];
-        thisSV6DOF.fLPR6DOFnm1[i] = thisSV6DOF.xfLPR6DOFnm1[i];
-        thisSV6DOF.fLPR6DOFnm2[i] = thisSV6DOF.xfLPR6DOFnm2[i];
-        ftmpA3x3[i] = xftmpA3x3[i];
-        ftmpA3x1[i] = xftmpA3x1[i];
-    }
-    // 4 row arrays
-    for (int i = 0; i < 4; i++)
-    {
-        ftmpA4x4[i] = xftmpA4x4[i];
-        ftmpB4x4[i] = xftmpB4x4[i];
-        ftmpA4x1[i] = xftmpA4x1[i];
-        ftmpB4x1[i] = xftmpB4x1[i];
-    }
-
-    // 7 row arrays
-    for (int i = 0; i < 7; i++)
-    {
-        ftmpA7x7[i] = xftmpA7x7[i];
-        ftmpB7x7[i] = xftmpB7x7[i];
-        ftmpA7x1[i] = xftmpA7x1[i];
-    }
-    // 10 row arrays
-    for (int i = 0; i < 10; i++)
-    {
-        ftmpA10x10[i] = xftmpA10x10[i];
-        ftmpB10x10[i] = xftmpB10x10[i];
-        ftmpA10x1[i] = xftmpA10x1[i];
-    }
-    // MAXMATINV row arrays
-//    for (int i = 0; i < MAXMATINV; i++)
-//    {
-//        icolind[i] = xicolind[i];
-//        irowind[i] = xirowind[i];
-//        ipivot[i] = xipivot[i];
-//    }
-
-    // for safety (ref option 0), initialize the geomagnetic field to something safe: 50uT and 50 deg
-//    thisSimulation.fB = 50.0F;
-//    thisSimulation.fDeltaDeg = 50.0F;
-
-    // initialize the magnetometer simulation calibration parameters to null
-//    fmatrixAeqI(thisSimulation.finvW, 3);   // null (identity matrix) inverse soft iron
-//    fmatrixAeqI(thisSimulation.fW, 3);      // null (identity matrix) forward soft iron
-//    thisSimulation.fVx = thisSimulation.fVy = thisSimulation.fVz = 0.0F;
-
-    // reset computed magnetic calibration and magnetometer data buffer
-    ResetMagCalibration(&thisMagCal, &thisMagneticBuffer);
-
-
-
-    // initialize the low pass filters for 6DOF orientation
-    fInitLPFOrientationMatrix(&fb0, &fa1, &fa2);
-}
-
 void ReadCalibrationFile()
 {
     FILE *f = fopen("./.calibration", "r");
@@ -1552,7 +980,6 @@ int main(int argc, char **argv)
 //    yMax = 380;
 //    zMin = -450;
 //    zMax = 100;
-    InitMagCalibrationData();
     ReadCalibrationFile();
 
 
